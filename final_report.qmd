@@ -1,0 +1,572 @@
+---
+title: "Fridays Tell the Story: How Remote Work Reshaped Commuting After COVID"
+author: "HUY LE TRAN, CONG THANH VU, MINH PHUONG PHAM"
+title-block-banner: true
+date: today
+bibliography: [refs/bibliography.bibtex, refs/Packages.bib]
+format: 
+  html: 
+    embed-resources: true # Creates a single HTML file as output
+    code-fold: true # Code folding; allows you to show/hide code chunks
+    code-tools: true # Includes a menu to download the code file
+table-of-contents: true # (Optional) Creates a table of contents!
+number-sections: true # (Optional) Puts numbers next to heading/subheadings
+---
+
+
+```{r message=FALSE, warning=FALSE, suppressMessages= TRUE}
+library(reticulate)
+use_python("/opt/anaconda3/bin/python3", required = TRUE)
+py_install("holidays")
+```
+
+```{r message=FALSE, warning=FALSE, suppressMessages= TRUE}
+# Import library
+knitr::opts_chunk$set(echo = TRUE)
+library(gendercoder)
+library(knitr)
+library(reshape2)
+library(dplyr)
+library(tidyverse)
+library(gt)
+library(janitor)
+library(ggpubr)
+library(hms)
+library(gridExtra)
+library(ggfortify)
+library(zoo)
+library(scales)
+```
+
+# Introduction
+
+The COVID-19 pandemic has fundamentally changed the way people live and work. As offices closed and remote work became the norm, daily routines and travel patterns were disrupted almost overnight. One of the most noticeable shifts has been in commuting behaviour, with fewer people travelling on certain weekdays, particularly on Mondays and Fridays, as flexible work arrangements allow employees to work from home on these days.
+
+These changes in commuting patterns have important implications for public transport planning, service scheduling, and urban policy. Additionally, other factors such as weather conditions and public holidays continue to influence people’s decisions to commute.
+
+In this challenge, we focus on the Friday ratio, which defined as Friday patronage relative to the average Monday–Thursday patronage, as a key indicator to understand how commuting behaviour has changed in the post-pandemic context. By examining how the Friday ratio has evolved and what factors drive its variation, we aim to uncover insights into new travel habits and their potential long-term impacts on public transport demand.
+
+
+# Data Source
+We integrated three datasets to analyze commuting behavior in New South Wales (NSW) from 2020 to 2025:
+
+- Opal Patronage: Contains hourly tap-on and tap-off counts for public transport usage across NSW, spanning from January 2020 to July 2025.
+
+```{r message=FALSE, warning=FALSE, suppressMessages= TRUE}
+# Load given dataset
+library(purrr)
+
+file_paths <- list.files(
+  path = "OpalPatronage",
+  pattern = "^Opal_Patronage_.*\\.txt$",
+  full.names = TRUE
+)
+
+df_list <- map(file_paths, ~ {
+  df <- read_delim(.x, delim = "|", show_col_types = FALSE)
+
+  df <- df %>%
+    mutate(
+      trip_origin_date = as.Date(trip_origin_date),
+      tap_hour = as.numeric(tap_hour)  # Force tap_hour to be numeric
+    )
+
+  return(df)
+})
+
+
+
+full_df <- bind_rows(df_list)
+
+
+convert <- function(x) {
+  suppressWarnings(as.numeric(x)) %>% replace_na(0)
+}
+
+full_df <- full_df %>%
+  mutate(
+    Tap_Ons = convert(Tap_Ons),
+    Tap_Offs = convert(Tap_Offs)
+  )
+```
+
+```{r message=FALSE, warning=FALSE, suppressMessages= TRUE}
+# Load public holiday
+library(reticulate)
+
+holidays <- import("holidays")
+
+aus_holidays <- holidays$Australia(prov = "NSW", years = as.integer(2020:2025))
+
+full_df$is_public_holiday <- full_df$trip_origin_date %in% as.Date(names(aus_holidays))
+```
+
+- Rainfall Data: Provides daily rainfall measurements for NSW regions, sourced from the [Bureau of Meteorology] [@bom].
+
+```{r message=FALSE, warning=FALSE, suppressMessages= TRUE}
+# Load rain dataset
+rainy_data <- read_csv("data/IDCJAC0009_066006_1800/IDCJAC0009_066006_1800_Data.csv", show_col_types = FALSE)
+
+
+colnames(rainy_data) <- c(
+  "product_code", "station_number", "year", "month", "day",
+  "rain_mm", "rain_period_days", "rain_quality"
+)
+
+# 2. Combine year, month, day into one date column
+rainy_data <- rainy_data %>%
+  mutate(date = make_date(year, month, day))
+
+# 3. Filter to study range
+rainy_data <- rainy_data %>%
+  filter(date >= as.Date("2020-01-01") & date <= as.Date("2025-07-15"))
+
+# 4. Convert rain_mm to numeric (coerce invalid entries to NA)
+rainy_data <- rainy_data %>%
+  mutate(rain_mm = as.numeric(rain_mm))
+
+# 5. Create rainy_day flag (rain > 1mm)
+rainy_data <- rainy_data %>%
+  mutate(rainy_day = if_else(rain_mm > 1, 1, 0, missing = 0))
+
+# 6. Keep only required columns
+rainy_data <- rainy_data %>%
+  select(date, rain_mm, rainy_day)
+
+# 7. Merge with your main df
+df <- full_df %>%
+  filter(!is.na(trip_origin_date)) %>%
+  mutate(trip_origin_date = as.Date(trip_origin_date))
+df <- df %>%
+  left_join(rainy_data, by = c("trip_origin_date" = "date"))
+```
+
+- Work-from-Home (WFH) Rate: Estimates the proportion of people working from home, derived from [ABS survey data] [@abs].
+
+```{r message=FALSE, warning=FALSE, suppressMessages= TRUE}
+# Load and Clean WFH data
+csv_path <- "data/Employed-people-who-worked-from-home.csv"
+raw <- read_csv(csv_path, skip = 1, show_col_types = FALSE)
+
+# --- 2. Keep only first 5 columns & rename ---------------------------------
+raw <- raw[, 1:5]
+names(raw) <- c("period", "upper_est", "lower_est", "wfh_rate", "wfh_most_time")
+
+# --- 3. Make sure numeric columns are numeric ------------------------------
+raw <- raw %>%
+  mutate(
+    upper_est = as.numeric(upper_est),
+    lower_est = as.numeric(lower_est),
+    wfh_rate  = as.numeric(wfh_rate),
+    wfh_most_time = as.numeric(wfh_most_time)
+  )
+
+# --- 4. Clean the period label ---------------------------------------------
+tidy_period <- function(label) {
+  label <- str_replace_all(label, "\u2013|\u2014", "-")  
+  label <- str_replace_all(label, "\\s*-\\s*", "-") 
+  label <- str_replace(label, "\\s*\\(.*\\)", "")      
+  str_trim(label)
+}
+
+raw <- raw %>%
+  mutate(
+    period_clean = tidy_period(period),
+    # parse "YYYY-Mon" like "2024-Apr"
+    date = parse_date_time(period_clean, orders = "Y-b", tz = "UTC", quiet = TRUE)
+  ) %>%
+  drop_na(date)
+
+# --- 5. Pick value: prefer wfh_rate, fallback to upper_est ------------------
+raw <- raw %>%
+  mutate(wfh_val = coalesce(wfh_rate, upper_est)) %>%
+  select(date, wfh_val) %>%
+  arrange(date)
+raw$date <- as.Date(raw$date)
+# --- 6. Build full DAILY date range ----------------------------------------
+full_range <- seq(from = min(raw$date), to = as.Date("2025-07-15"), by = "day")
+
+daily <- tibble(date = full_range) %>%
+  left_join(raw, by = "date")
+
+
+# --- 7. LINEAR interpolation over time -------------------------------------
+daily <- daily %>%
+  arrange(date) %>%
+  mutate(wfh_val_interp = na.approx(wfh_val, x = date, na.rm = FALSE))
+
+# --- 8. Pre-COVID patch: overwrite 2020-01-01 to 2020-03-31 -----------------
+
+pre_covid_value <- raw %>%
+  filter(date <= as.Date("2020-01-01")) %>%
+  arrange(desc(date)) %>%
+  slice(1) %>%
+  pull(wfh_val)
+
+if (length(pre_covid_value) == 0L || is.na(pre_covid_value)) {
+  warning("No pre-2020 anchor found; using first available wfh_val.")
+  pre_covid_value <- raw$wfh_val[1]
+}
+
+daily <- daily %>%
+  mutate(
+    wfh_rate = if_else(
+      date >= as.Date("2020-01-01") & date <= as.Date("2020-03-31"),
+      pre_covid_value,
+      wfh_val_interp
+    )
+  ) %>%
+  # final study period cut
+  filter(date >= as.Date("2020-01-01") & date <= as.Date("2025-07-15")) %>%
+  select(date, wfh_rate)
+```
+
+
+# Exploratory Data Analysis
+
+## Commuting Patterns and the Impact of COVID-19
+
+### Regional Distribution of Tap-On Counts
+
+Boxplots of tap-on counts by region reveal that **‘Other’ areas recorded the highest median patronage**, followed by **Sydney CBD**, while **Newcastle and surrounds had the lowest** (@fig-boxplot). This suggests that public transport demand is most concentrated in central and broader metropolitan areas.
+
+```{r}
+
+region_daily <- full_df %>%
+  group_by(trip_origin_date, ti_region) %>%
+  summarise(Tap_Ons = sum(Tap_Ons, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = ti_region, values_from = Tap_Ons)
+
+
+region_daily_smoothed <- region_daily %>%
+  arrange(trip_origin_date) %>%
+  mutate(across(-trip_origin_date, ~ rollmean(.x, k = 90, fill = NA, align = "right")))
+
+region_long <- region_daily_smoothed %>%
+  pivot_longer(-trip_origin_date, names_to = "Region", values_to = "Tap_Ons")
+```
+
+```{r fig-boxplot}
+ggplot(region_long, aes(x = Region, y = Tap_Ons, fill = Region)) +
+  geom_boxplot(outlier.size = 0.7, outlier.alpha = 0.3, width = 0.6) +
+  scale_y_log10(labels = comma) +
+  scale_fill_viridis_d(option = "C", guide = "none") +  # Discrete viridis palette
+  labs(
+    title = "Tap-On Counts by Region (90-Day Rolling Average, Log-Scale)",
+    subtitle = "Boxplot of Smoothed Daily Tap-Ons (Log10)",
+    x = "Region",
+    y = "Tap-Ons (log scale)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 13, margin = margin(b = 10)),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.y = element_line(color = "gray80"),
+    panel.grid.minor.y = element_blank()
+  )
+```
+
+
+### Long-Term Trends via Rolling Averages
+
+To understand how travel patterns evolved over time, we grouped daily tap-on counts by region and applied a **90-day rolling average**. The resulting time series (@fig-linegraph) shows **two major drops** in patronage: one beginning in **March 2020** and another before **January 2023**. These drops align with major **COVID-19 lockdowns and ongoing shifts in work routines**, as people reduced travel to mitigate infection risk. Overall, patronage **peaked just before the pandemic**, fell sharply during lockdowns, and has **gradually rebounded** since.
+
+```{r fig-linegraph}
+# Plot
+ggplot(region_long, aes(x = trip_origin_date, y = Tap_Ons, color = Region)) +
+  geom_line(na.rm = TRUE) +
+  scale_y_log10(labels = comma_format()) +
+  labs(
+    title = "Daily Tap-Ons by Region (90-Day Rolling Average)",
+    x = "Date",
+    y = "Tap-Ons (log scale)",
+    color = "Region"
+  ) +
+  theme_minimal(base_size = 5) +
+  theme(legend.position = "right")
+```
+
+### Friday vs. Midweek Commuting
+
+To examine weekday differences, we compared average tap-on counts between **Fridays and Monday–Thursday**, focusing on **5–11 AM** as the key commuting window. Line graphs (@fig-linegraph_hour) show that **commuter numbers on Fridays are consistently lower between 7–9 AM**, though the gap narrows after 9 AM. This pattern is more pronounced **post-COVID**, suggesting a **structural shift in Friday commuting**, likely due to flexible work arrangements.
+
+```{r fig-linegraph_hour}
+# Step 1: Filter AM peak (07:00–10:00)
+peak <- df %>%
+  filter(tap_hour >= 7, tap_hour < 10)
+
+# Step 2: Add calendar fields
+peak <- peak %>%
+  mutate(
+    dow = wday(trip_origin_date, week_start = 1) - 1,  # Mon = 0, ..., Sun = 6
+    year = year(trip_origin_date),
+    era = case_when(
+      trip_origin_date < as.Date("2020-03-01") ~ "pre",
+      trip_origin_date >= as.Date("2023-01-01") ~ "post",
+      TRUE ~ "ignore"
+    )
+  ) %>%
+  filter(era != "ignore")  # Drop transitional period
+
+# --- Friday ratio section ---
+daily_ratio <- peak %>%
+  group_by(era, trip_origin_date, dow) %>%
+  summarise(Tap_Ons = sum(Tap_Ons, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    iso_year = isoyear(trip_origin_date),
+    iso_week = isoweek(trip_origin_date),
+    yrwk = iso_year * 100 + iso_week
+  )
+
+weekly_ratio <- daily_ratio %>%
+  pivot_wider(
+    id_cols = c(era, yrwk),
+    names_from = dow,
+    values_from = Tap_Ons,
+    names_prefix = "dow_"
+  ) %>%
+  mutate(
+    Mon_Thu_mean = rowMeans(select(., dow_0, dow_1, dow_2, dow_3), na.rm = TRUE),
+    fri_ratio = dow_4 / Mon_Thu_mean
+  )
+
+summary_stats <- weekly_ratio %>%
+  group_by(era) %>%
+  summarise(
+    mean = mean(fri_ratio, na.rm = TRUE),
+    median = median(fri_ratio, na.rm = TRUE),
+    stdev = sd(fri_ratio, na.rm = TRUE),
+    n_weeks = n()
+  )
+
+
+# Step 0: Prepare and filter by era
+df <- full_df %>%
+  mutate(
+    dow = wday(trip_origin_date, week_start = 1) - 1,
+    era = case_when(
+      trip_origin_date < as.Date("2020-03-01") ~ "pre",
+      trip_origin_date >= as.Date("2023-01-01") ~ "post",
+      TRUE ~ "ignore"
+    )
+  ) %>%
+  filter(era != "ignore") %>%
+  left_join(daily, by = c("trip_origin_date" = "date")) %>%           # for wfh_rate
+  left_join(rainy_data, by = c("trip_origin_date" = "date"))
+
+
+morning <- df %>%
+  filter(dow <= 4, tap_hour >= 5, tap_hour <= 11) %>%
+  mutate(
+    wd_group = if_else(dow == 4, "Friday", "Mon–Thu"),
+    era_label = factor( dplyr::recode(era, "pre" = "Early 2020", "post" = "2023–25"),
+                     levels = c("Early 2020", "2023–25"))
+  )
+
+hourly_avg <- morning %>%
+  group_by(era_label, wd_group, tap_hour) %>%
+  summarise(mean_taps = mean(Tap_Ons, na.rm = TRUE), .groups = "drop")
+
+# Step 3: Faceted line plot
+ggplot(hourly_avg, aes(x = tap_hour, y = mean_taps, color = wd_group, shape = wd_group)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ era_label, nrow = 1) +
+  scale_color_manual(values = c("Mon–Thu" = "#4c72b0", "Friday" = "#dd8452")) +
+  labs(
+    title = "AM Patronage Levels • Friday vs Mon–Thu",
+    x = "Hour of day",
+    y = "Average taps per weekday",
+    color = "Weekday Group",
+    shape = "Weekday Group"
+  ) +
+  geom_vline(xintercept = c(8, 9, 10), linetype = "dashed", linewidth = 0.5, color = "grey60", alpha = 0.4) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 13, face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "top"
+  )
+```
+
+
+### Investigating Drivers of Friday Decline
+
+Motivated by the clear Friday dip, we focused on the **7:00–10:00 AM peak window** and extracted weekly tap-on data to evaluate the influence of **work-from-home (WFH) rates**, **weather**, and **public holidays**.
+
+To quantify changes, we calculated the **Friday Ratio**, defined as:
+
+
+This metric captures how **Friday travel compares to typical midweek levels**.
+
+### Pre- vs Post-COVID Comparison
+
+We compared the Friday ratio between the **pre-COVID period (9 weeks)** and the **post-COVID period (134 weeks)**. The mean Friday ratio dropped from **1.07** to **0.84** (@fig-barplot2), reflecting a **notable reduction in Friday commuting** relative to midweek.
+
+```{r fig-barplot2}
+# Optional: Bar plot of mean Friday ratio
+ggplot(summary_stats, aes(x = era, y = mean, fill = era)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  labs(
+    title = "Friday-to-Mon–Thu AM-Peak Ratio (Pre vs Post COVID)",
+    x = "Era",
+    y = "Mean Friday Ratio"
+  ) +
+  theme_minimal(base_size = 14) +
+  scale_y_continuous(labels = scales::comma)
+```
+### Seasonal Trends and Holiday Effects
+
+A heatmap of weekly Friday ratios (@fig-heatmap) shows that **pre-COVID values were stable and near 1**, while **post-COVID values dropped and remained low**. Additionally, we observed **seasonal fluctuations** around holidays: in some weeks, Friday commuting **spiked or dipped sharply**, likely due to **holiday events or long weekends**. This suggests that **calendar events play an ongoing role** in shaping Friday travel behavior, even beyond pandemic effects.
+
+```{r}
+weekly_ratio <- daily_ratio %>%
+  mutate(
+    iso_year = isoyear(trip_origin_date),
+    iso_week = isoweek(trip_origin_date),
+    yrwk = iso_year * 100 + iso_week
+  ) %>%
+  pivot_wider(
+    id_cols = c(era, yrwk, iso_year, iso_week),
+    names_from = dow,
+    values_from = Tap_Ons,
+    names_prefix = "dow_"
+  ) %>%
+  mutate(
+    Mon_Thu_mean = rowMeans(select(., starts_with("dow_0"), starts_with("dow_1"), 
+                                        starts_with("dow_2"), starts_with("dow_3")), na.rm = TRUE),
+    fri_ratio = dow_4 / Mon_Thu_mean
+  )
+
+```
+
+
+```{r fig-heatmap}
+library(RColorBrewer)
+
+heat <- weekly_ratio %>%
+  mutate(
+    year = floor(yrwk / 100),
+    week = yrwk %% 100,
+    fri_ratio = pmax(pmin(fri_ratio, 1.2), 0.2)
+  ) %>%
+  filter(!is.na(fri_ratio))
+
+
+ggplot(heat, aes(x = week, y = factor(year, levels = sort(unique(year), decreasing = TRUE)), fill = fri_ratio)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradientn(
+    colours = rev(brewer.pal(11, "RdYlGn")),
+    limits = c(0.2, 1.2),
+    breaks = seq(0.2, 1.2, 0.2),
+    name = "Friday / Mon–Thu\nAM-peak ratio"
+  ) +
+  scale_x_continuous(breaks = seq(1, 52, 4)) +
+  labs(
+    title = "How “WFH Friday” evolved week-by-week",
+    subtitle = "(Lower = fewer Friday commuters)",
+    x = "ISO week number",
+    y = "Calendar year"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 0, vjust = 0.5),
+    axis.text.y = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+# Choosing Model
+
+To quantify the impact of different factors on Friday commuting behaviour, we constructed an Ordinary Least Squares (OLS) regression model. The dependent variable in our model was the Friday ratio, which measures Friday’s patronage relative to the average Monday–Thursday patronage each week. We included the following independent variables as predictors:
+Public holiday indicator – a dummy variable indicating whether a given date was a public holiday, as public holidays can significantly reduce commuting.
+Daily weather conditions – specifically rainfall, since rainy days may discourage people from commuting or shift their mode choice.
+Work-from-home rate – reflecting the proportion of workers working remotely, which directly reduces commuter numbers.
+This model aimed to determine whether and how these factors influence the Friday ratio.
+
+
+```{r}
+# Join WFH rate into Opal data (match on trip_origin_date)
+df <- df %>%
+  left_join(daily, by = c("trip_origin_date" = "date"))
+
+# ── 1. Filter Friday rows only ─────────────────────────────
+opal_fri <- df %>%
+  filter(wday(trip_origin_date, week_start = 1) == 5)  # 5 = Friday (Mon=1)
+
+# Drop unwanted 6th column (Python does this to remove 'trip_id' or similar)
+opal_fri <- opal_fri[, -6]
+
+# Add ISO year and week
+opal_fri <- opal_fri %>%
+  mutate(
+    iso_year = isoyear(trip_origin_date),
+    iso_week = isoweek(trip_origin_date)
+  )
+
+# Prepare weekly_cpy from `weekly` (extract iso_year + iso_week from yrwk)
+weekly_cpy <- weekly_ratio %>%
+  mutate(
+    yrwk = as.integer(yrwk),
+    iso_year = yrwk %/% 100,
+    iso_week = yrwk %% 100
+  ) %>%
+  select(iso_year, iso_week, fri_ratio)
+
+# ── 2. Merge Friday-level data with weekly Friday ratio ─────
+opal_fri <- opal_fri %>%
+  left_join(weekly_cpy, by = c("iso_year", "iso_week")) %>%
+  filter(ti_region == "All - NSW")
+
+# ── 3. Keep AM Peak window (07–10) ─────────────────────────
+peak_hrs <- opal_fri %>%
+  filter(tap_hour %in% c(7, 8, 9, 10))
+
+# ── 4. Aggregate per day ───────────────────────────────────
+hourly <- peak_hrs %>%
+  group_by(trip_origin_date) %>%
+  summarise(
+    Tap_Ons            = sum(Tap_Ons, na.rm = TRUE),
+    fri_ratio          = first(fri_ratio),
+    wfh_rate           = first(wfh_rate.x),
+    rain_mm            = first(rain_mm),
+    rainy_day          = first(rainy_day),
+    is_public_holiday  = first(is_public_holiday),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+hourly_clean <- hourly %>%
+  filter(!is.na(fri_ratio), !is.na(wfh_rate), !is.na(is_public_holiday), !is.na(rainy_day))
+
+
+model <- lm(fri_ratio ~ is_public_holiday + wfh_rate + rainy_day, data = hourly_clean)
+
+summary(model)
+```
+
+# Analysis
+
+The linear regression model achieved an R² value of around 0.515, indicating that approximately 51.5% of the variation in Friday ratios is explained by the predictors included. The work-from-home rate showed a significant negative relationship with Friday commuting, with a coefficient of -0.034 (p < 0.001), suggesting that higher remote work rates are associated with lower Friday ratios, meaning fewer people commute on Fridays when working from home is more common. Additionally, the public holiday indicator also had a strong negative effect, with a coefficient of -0.646 (p < 0.001), indicating that weeks with public holidays experience significantly reduced Friday commuting compared to regular weeks. In contrast, rainfall did not have a significant impact on Friday ratios (p = 0.282), suggesting that weather conditions such as rain do not meaningfully influence commuting levels on Fridays. The model intercept of 2.149 represents the expected Friday ratio when both work-from-home rates and public holidays are zero, implying that, under normal circumstances, Friday commuting would be substantially higher.
+
+# Conclusion
+
+The analysis reveals a clear shift in commuting behaviour between the pre- and post-COVID periods. As shown in the EDA, Friday ratios were consistently higher before COVID, indicating that people commuted on Fridays at similar or even higher levels compared to mid-week days. However, after COVID, Friday ratios dropped noticeably and remained lower, reflecting a structural change in travel patterns.
+The OLS regression model confirms that work-from-home rates have a significant negative effect on Friday commuting, suggesting that the increase in remote work after the pandemic has directly contributed to this decline. Additionally, public holidays were found to further reduce Friday commuting, with weeks containing public holidays seeing a substantial drop in Friday ratios. This highlights that Fridays are particularly sensitive to both behavioural shifts like remote work and calendar factors such as public holidays. Aside from people working entirely remote, people who work hybridly are flexible of choosing which day to work at home , often choosing Friday  which often create long weekends(Friday, Saturday, Sunday off) and reduce the need for commuting.
+These results imply that COVID-19 not only caused an immediate drop in travel during lockdowns but also established new work habits, such as working from home on Fridays, that have continued in the post-pandemic era. Fridays, in particular, tell a powerful story of how remote work and flexible scheduling have reshaped commuting – turning what was once a routine office day into a preferred work-from-home or leave day for many.
+This shift has important implications for transport planning and policy, highlighting the need to adapt service provision to reflect reduced and more variable commuter demand on Fridays, and recognising that Fridays now symbolise the enduring transformation of work and travel behaviour in Australia’s new hybrid era.
+
+
+# Limitation
+
+One limitation of this analysis is the lack of high-frequency work-from-home (WFH) data. The available WFH rates are recorded only at an annual level, while other variables, such as patronage and weather, are at a daily scale. This mismatch in temporal resolution may reduce the accuracy of modelling results, as it assumes a constant WFH rate throughout each year, ignoring potential week-to-week fluctuations. Additionally, the WFH data for 2022 was estimated by assumption linear interpolation, as it was not officially recorded by ABS, introducing potential bias or measurement error. We based on statistic distribution from this research during pandemic to formulate 
+
+
+
+
+Furthermore, the Friday ratio (decision variable) is a derived metric rather than a direct observed variable, and its distribution is non-normal, which could affect the validity of linear regression assumptions. These data constraints should be considered when interpreting the findings and in future research aiming to model commuting behaviour more precisely.
