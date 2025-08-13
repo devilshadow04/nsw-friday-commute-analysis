@@ -4,7 +4,7 @@
 The COVID-19 pandemic fundamentally changed how people live and work. With offices closed and remote work becoming common, daily routines and travel patterns shifted almost overnight.  
 One of the most visible changes has been in commuting behaviour, particularly on Mondays and Fridays, as flexible work arrangements allowed more employees to work from home.  
 
-This project investigates how commuting patterns have evolved in New South Wales (NSW) from 2020–2025, focusing on the **Friday ratio** — defined as **Friday patronage relative to the average Monday–Thursday patronage**.  
+This project investigates how commuting patterns have evolved in New South Wales (NSW) from 2020–2025, focusing on the **Friday ratio**, which is defined as **Friday patronage relative to the average Monday - Thursday patronage**.  
 By analysing how this ratio has changed and identifying its drivers, we aim to uncover insights into post-pandemic travel habits and their long-term impact on public transport.
 
 ---
